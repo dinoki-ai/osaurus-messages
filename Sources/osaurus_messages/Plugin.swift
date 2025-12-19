@@ -428,7 +428,7 @@ private var api: osr_plugin_api = {
                 },
                 "required": ["phoneNumber", "message"]
               },
-              "requirements": [],
+              "requirements": ["automation"],
               "permission_policy": "ask"
             },
             {
