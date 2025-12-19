@@ -42,7 +42,10 @@ private func runCommand(_ command: String) -> Result<String, Error> {
     let output = String(data: data, encoding: .utf8) ?? ""
 
     if process.terminationStatus != 0 {
-      return .failure(NSError(domain: "CommandError", code: Int(process.terminationStatus), userInfo: [NSLocalizedDescriptionKey: output]))
+      return .failure(
+        NSError(
+          domain: "CommandError", code: Int(process.terminationStatus),
+          userInfo: [NSLocalizedDescriptionKey: output]))
     }
 
     return .success(output)
@@ -194,7 +197,8 @@ private struct ReadMessagesTool {
       LIMIT \(limit)
       """
 
-    let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: " ")
+    let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(
+      of: "\n", with: " ")
     let command = "sqlite3 -json \"\(dbPath)\" \"\(escapedQuery)\""
 
     let result = runCommand(command)
@@ -208,8 +212,11 @@ private struct ReadMessagesTool {
       return encodeJSON(messages)
     case .failure(let error):
       let errorMessage = error.localizedDescription
-      if errorMessage.contains("unable to open database") || errorMessage.contains("permission denied") {
-        return "{\"error\": \"Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access.\"}"
+      if errorMessage.contains("unable to open database")
+        || errorMessage.contains("permission denied")
+      {
+        return
+          "{\"error\": \"Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access.\"}"
       }
       return "{\"error\": \"\(escapeJSON(errorMessage))\"}"
     }
@@ -264,7 +271,8 @@ private struct GetUnreadMessagesTool {
       LIMIT \(maxLimit)
       """
 
-    let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(of: "\n", with: " ")
+    let escapedQuery = query.replacingOccurrences(of: "\"", with: "\\\"").replacingOccurrences(
+      of: "\n", with: " ")
     let command = "sqlite3 -json \"\(dbPath)\" \"\(escapedQuery)\""
 
     let result = runCommand(command)
@@ -278,8 +286,11 @@ private struct GetUnreadMessagesTool {
       return encodeJSON(messages)
     case .failure(let error):
       let errorMessage = error.localizedDescription
-      if errorMessage.contains("unable to open database") || errorMessage.contains("permission denied") {
-        return "{\"error\": \"Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access.\"}"
+      if errorMessage.contains("unable to open database")
+        || errorMessage.contains("permission denied")
+      {
+        return
+          "{\"error\": \"Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access.\"}"
       }
       return "{\"error\": \"\(escapeJSON(errorMessage))\"}"
     }
@@ -448,7 +459,7 @@ private var api: osr_plugin_api = {
                 },
                 "required": ["phoneNumber"]
               },
-              "requirements": [],
+              "requirements": ["disk"],
               "permission_policy": "auto"
             },
             {
@@ -464,7 +475,7 @@ private var api: osr_plugin_api = {
                 },
                 "required": []
               },
-              "requirements": [],
+              "requirements": ["disk"],
               "permission_policy": "auto"
             }
           ]
