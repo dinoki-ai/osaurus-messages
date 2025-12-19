@@ -1,0 +1,48 @@
+{
+  "plugin_id": "osaurus.messages",
+  "name": "Messages",
+  "description": "Interact with macOS Messages.app - send and read iMessages",
+  "homepage": "https://github.com/dinoki-ai/osaurus-messages",
+  "license": "MIT",
+  "authors": [
+    "dinoki-ai"
+  ],
+  "capabilities": {
+    "tools": [
+      {
+        "name": "send_message",
+        "description": "Send an iMessage to a phone number"
+      },
+      {
+        "name": "read_messages",
+        "description": "Read message history from a specific contact"
+      },
+      {
+        "name": "get_unread_messages",
+        "description": "Get all unread messages from all contacts"
+      }
+    ]
+  },
+  "public_keys": {
+    "minisign": "RWTBzaXEFjz7BFKd+ZtOWrNQ6/eO5EJ/PlZvg1DsVtYq+BQ3/XSBSXII"
+  },
+  "versions": [
+    {
+      "version": "1.0.0",
+      "release_date": "2025-12-19",
+      "artifacts": [
+        {
+          "os": "macos",
+          "arch": "arm64",
+          "min_macos": "13.0",
+          "url": "https://github.com/dinoki-ai/osaurus-messages/releases/download/1.0.0/osaurus.messages-1.0.0.zip",
+          "sha256": "c43a75fd5fc265865eb6ec97578cb29641d49aa983267b6a6252de19554ac2df",
+          "size": 43376,
+          "minisign": {
+            "signature": "untrusted comment: signature from minisign secret key\nRWTBzaXEFjz7BIqQIJ+GEj/rdKNnxTNqmAoGFqS8cDuiDOpc/FtV1/ZibwhQOl1dIg2X0Nu7ZtNhLof9mNXpz4vrOBlBC4mXEgg=\ntrusted comment: timestamp:1766170300\tfile:osaurus.messages-1.0.0.zip\nnqZqnq9FAINyh0aubshdlXqfFKKkjZFiqF9dhszxrQiIG8S+FuvPr27i+zKiKDMOHj5iDjR3nAB5usvpt2J9Bg=="
+          }
+        }
+      ]
+    }
+  ]
+}
