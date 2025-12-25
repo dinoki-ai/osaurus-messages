@@ -28,18 +28,18 @@
   },
   "versions": [
     {
-      "version": "1.0.2",
-      "release_date": "2025-12-19",
+      "version": "1.0.3",
+      "release_date": "2025-12-25",
       "artifacts": [
         {
           "os": "macos",
           "arch": "arm64",
           "min_macos": "13.0",
-          "url": "https://github.com/dinoki-ai/osaurus-messages/releases/download/1.0.2/osaurus.messages-1.0.2.zip",
-          "sha256": "90c455088c47aac13083b3a8b4c91c2d5bae75ec1d6c2672ac4f73008837ccef",
-          "size": 43391,
+          "url": "https://github.com/dinoki-ai/osaurus-messages/releases/download/1.0.3/osaurus.messages-1.0.3.zip",
+          "sha256": "8a61ce939b28ca3102469a976353cc08e985fb1e7ba05aafa4be26161ddedb21",
+          "size": 41141,
           "minisign": {
-            "signature": "untrusted comment: signature from minisign secret key\nRWTBzaXEFjz7BHHIH4vy/Nobbxx+wX6PUrc095DNs/XOYJgOatub4bmZ2+hEg7tnY4KsJ8uk0OEGrLA/63mSAj6+iciloXKM3QM=\ntrusted comment: timestamp:1766178995\tfile:osaurus.messages-1.0.2.zip\nOrITSuyTRw0wbi8pQmI9FyKUUk+NAgVBJ9BunZMFbcxtXE7K0iiYxg4+wrQ/rHwRB0iF+pcn3LRgfaAv+gjPBw=="
+            "signature": "untrusted comment: signature from minisign secret key\nRWTBzaXEFjz7BP/VsuBexoRHxfD/myNPelNRYvBpKdVjfMQ6XCb4SBgBDKwDZ3B/NA7pgIWaS/v2c3+ogI7VKJ6uIcl0zF9BJQ0=\ntrusted comment: timestamp:1766666676\tfile:osaurus.messages-1.0.3.zip\ndnS+tBf8oU4xiTqHZLibdbRgj0vpBfge+f+bGQbirfR+ZD2kwsgcD2qpp0SM02TPHyzpXZx1h9nYrNP6fSsDBA=="
           }
         }
       ]
