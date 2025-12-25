@@ -70,33 +70,27 @@ private func normalizePhoneNumber(_ phone: String) -> [String] {
   // Remove all non-numeric characters except +
   let cleaned = phone.filter { $0.isNumber || $0 == "+" }
 
-  // If it's already in the correct format (+1XXXXXXXXXX)
-  if cleaned.hasPrefix("+1") && cleaned.count == 12 {
+  // If it already has a country code (starts with +), use as-is
+  if cleaned.hasPrefix("+") && cleaned.count >= 10 {
     return [cleaned]
   }
 
-  // If it starts with 1 and has 11 digits total
+  // If it starts with 1 and has 11 digits total, assume US number
   if cleaned.hasPrefix("1") && cleaned.count == 11 {
     return ["+\(cleaned)"]
   }
 
-  // If it's 10 digits
-  if cleaned.count == 10 && !cleaned.hasPrefix("+") {
+  // If it's 10 digits, assume US number and add +1
+  if cleaned.count == 10 {
     return ["+1\(cleaned)"]
   }
 
-  // Try multiple formats
-  var formats: Set<String> = []
-
-  if cleaned.hasPrefix("+1") {
-    formats.insert(cleaned)
-  } else if cleaned.hasPrefix("1") {
-    formats.insert("+\(cleaned)")
-  } else {
-    formats.insert("+1\(cleaned)")
+  // For other formats, return as-is with + prefix if missing
+  if !cleaned.hasPrefix("+") {
+    return ["+\(cleaned)"]
   }
 
-  return Array(formats)
+  return [cleaned]
 }
 
 // MARK: - Database Path
