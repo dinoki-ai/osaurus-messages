@@ -439,7 +439,7 @@ private var api: osr_plugin_api = {
                 "required": ["phoneNumber"]
               },
               "requirements": ["disk"],
-              "permission_policy": "auto"
+              "permission_policy": "ask"
             },
             {
               "id": "get_unread_messages",
@@ -456,7 +456,7 @@ private var api: osr_plugin_api = {
                 "required": []
               },
               "requirements": ["disk"],
-              "permission_policy": "auto"
+              "permission_policy": "ask"
             }
           ]
         }
