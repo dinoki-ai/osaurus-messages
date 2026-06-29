@@ -24,7 +24,7 @@ Add the application using this plugin. This is required to access the Messages d
 
 ### `send_message`
 
-Send an iMessage to a phone number. Uses AppleScript to interact with Messages.app directly.
+Send a message to a phone number. Tries iMessage first and automatically falls back to SMS (requires Text Message Forwarding) when iMessage is unavailable for the recipient. Uses AppleScript to interact with Messages.app directly.
 
 **Parameters:**
 
@@ -45,7 +45,19 @@ Send an iMessage to a phone number. Uses AppleScript to interact with Messages.a
 ```json
 {
   "success": true,
+  "service": "iMessage",
   "message": "Message sent to +15551234567"
+}
+```
+
+On failure, tools return the canonical Osaurus error envelope so the agent harness can detect and classify the error:
+
+```json
+{
+  "ok": false,
+  "kind": "unavailable",
+  "message": "Could not send message: ... ",
+  "retryable": false
 }
 ```
 
@@ -124,7 +136,7 @@ All message-reading tools return messages in this format:
 
 | Field         | Type       | Description                                                                                           |
 | ------------- | ---------- | ----------------------------------------------------------------------------------------------------- |
-| `content`     | `string`   | The message text, `[Rich text message]` for formatted messages, or `[Attachment]` for media-only messages |
+| `content`     | `string`   | The message text (decoded from `attributedBody` when needed), `[Attachment]` for media-only messages, or `[No content]` |
 | `date`        | `string`   | Date/time the message was sent (local time)                                                           |
 | `sender`      | `string`   | Phone number or email of the sender (`Me` or `Unknown` when unavailable)                              |
 | `isFromMe`    | `boolean`  | Whether you sent this message                                                                         |
@@ -190,7 +202,7 @@ Ensure you've granted Automation permissions and that Messages.app is properly c
 
 ### Messages showing as "[Rich text message]"
 
-Some messages use rich formatting (links, mentions, reactions) and store text in a binary format (`attributedBody`) that cannot be directly read as plain text. The actual message content exists but is displayed with this placeholder.
+Older versions returned this placeholder for any message whose text was stored in the binary `attributedBody` column (links, mentions, messages from newer clients). The plugin now decodes `attributedBody` on a best-effort basis, so most of these messages return their real text. `[Rich text message]` is no longer used; if a body genuinely can't be decoded you'll see `[Attachment]` (media-only) or `[No content]`.
 
 ### Messages showing as "[Attachment]"
 

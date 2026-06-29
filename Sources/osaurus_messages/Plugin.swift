@@ -36,7 +36,7 @@ private struct Message: Codable {
 
 // MARK: - Phone Number Normalization
 
-private func normalizePhoneNumber(_ phone: String) -> [String] {
+func normalizePhoneNumber(_ phone: String) -> [String] {
   // Remove all non-numeric characters except +
   let cleaned = phone.filter { $0.isNumber || $0 == "+" }
 
@@ -114,12 +114,27 @@ private func queryMessages(query: String, params: [String] = []) -> Result<[Mess
   var messages: [Message] = []
   while sqlite3_step(stmt) == SQLITE_ROW {
     // Read each column, handling NULLs per-row so one bad row doesn't destroy all results
-    let content = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "[No content]"
+    let plainText = sqlite3_column_text(stmt, 0).map { String(cString: $0) }
     let date = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "Unknown"
     let sender = sqlite3_column_text(stmt, 2).map { String(cString: $0) } ?? "Unknown"
     let isFromMe = sqlite3_column_int(stmt, 3) == 1
     let hasAttachments = sqlite3_column_int(stmt, 4) == 1
     let attachmentInfo = sqlite3_column_text(stmt, 5).map { String(cString: $0) }
+
+    // Decode the message body: prefer the plain `text` column, then fall back
+    // to decoding the `attributedBody` blob (col 6), and only then to a
+    // placeholder. Previously rich-formatted messages always returned
+    // "[Rich text message]" even though their text was recoverable.
+    var content: String
+    if let plainText, !plainText.isEmpty {
+      content = plainText
+    } else if let blobPtr = sqlite3_column_blob(stmt, 6) {
+      let blobLen = Int(sqlite3_column_bytes(stmt, 6))
+      let blob = Data(bytes: blobPtr, count: blobLen)
+      content = AttributedBody.extractText(from: blob) ?? (hasAttachments ? "[Attachment]" : "[No content]")
+    } else {
+      content = hasAttachments ? "[Attachment]" : "[No content]"
+    }
 
     var attachments: [String]? = nil
     if hasAttachments {
@@ -157,32 +172,59 @@ private struct SendMessageTool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Could not parse arguments. Expected JSON with 'phoneNumber' and 'message'.")
+    }
+
+    let trimmedMessage = input.message.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !trimmedMessage.isEmpty else {
+      return Envelope.failure(.invalidArgs, "'message' must not be empty.")
     }
 
     let phoneNumbers = normalizePhoneNumber(input.phoneNumber)
-    guard let phoneNumber = phoneNumbers.first else {
-      return "{\"success\": false, \"message\": \"Invalid phone number format\"}"
+    guard let phoneNumber = phoneNumbers.first, !phoneNumber.isEmpty else {
+      return Envelope.failure(.invalidArgs, "Invalid phone number format: \(input.phoneNumber)")
     }
 
     let escapedMessage = escapeAppleScript(input.message)
 
-    let script = """
+    // Try iMessage first, then fall back to SMS (requires Text Message
+    // Forwarding). Previously this only ever used iMessage, so any recipient
+    // without iMessage — or any account where no iMessage service was active —
+    // failed outright.
+    let iMessageResult = runAppleScript(sendScript(service: "iMessage", phone: phoneNumber, message: escapedMessage))
+    if case .success = iMessageResult {
+      return "{\"success\": true, \"service\": \"iMessage\", \"message\": \"Message sent to \(escapeJSON(phoneNumber))\"}"
+    }
+
+    let smsResult = runAppleScript(sendScript(service: "SMS", phone: phoneNumber, message: escapedMessage))
+    switch smsResult {
+    case .success:
+      return "{\"success\": true, \"service\": \"SMS\", \"message\": \"Message sent to \(escapeJSON(phoneNumber)) via SMS\"}"
+    case .failure(let error):
+      let reason = error.localizedDescription
+      // Permission/automation problems are environment issues the user must
+      // resolve, so surface them as `unavailable` (non-retryable as-is).
+      if reason.localizedCaseInsensitiveContains("not allowed")
+        || reason.localizedCaseInsensitiveContains("permission")
+        || reason.localizedCaseInsensitiveContains("Application isn’t running")
+      {
+        return Envelope.failure(
+          .unavailable,
+          "Could not send message: \(reason). Ensure Messages.app is running and Osaurus has Automation permission for Messages.",
+          retryable: false)
+      }
+      return Envelope.failure(.executionError, "Failed to send message to \(phoneNumber): \(reason)")
+    }
+  }
+
+  private func sendScript(service: String, phone: String, message: String) -> String {
+    return """
       tell application "Messages"
-          set targetService to 1st service whose service type = iMessage
-          set targetBuddy to buddy "\(phoneNumber)" of targetService
-          send "\(escapedMessage)" to targetBuddy
+          set targetService to 1st service whose service type = \(service)
+          set targetBuddy to buddy "\(phone)" of targetService
+          send "\(message)" to targetBuddy
       end tell
       """
-
-    let result = runAppleScript(script)
-
-    switch result {
-    case .success:
-      return "{\"success\": true, \"message\": \"Message sent to \(escapeJSON(phoneNumber))\"}"
-    case .failure(let error):
-      return "{\"success\": false, \"message\": \"\(escapeJSON(error.localizedDescription))\"}"
-    }
   }
 }
 
@@ -200,28 +242,25 @@ private struct ReadMessagesTool {
     guard let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     else {
-      return "{\"error\": \"Invalid arguments\"}"
+      return Envelope.failure(.invalidArgs, "Could not parse arguments. Expected JSON with 'phoneNumber' and optional 'limit'.")
     }
 
-    let limit = min(input.limit ?? 10, 50)
+    let limit = max(1, min(input.limit ?? 10, 50))
     let phoneNumbers = normalizePhoneNumber(input.phoneNumber)
 
-    guard let phoneNumber = phoneNumbers.first else {
-      return "{\"error\": \"Invalid phone number format\"}"
+    guard let phoneNumber = phoneNumbers.first, !phoneNumber.isEmpty else {
+      return Envelope.failure(.invalidArgs, "Invalid phone number format: \(input.phoneNumber)")
     }
 
     let query = """
       SELECT
-          CASE
-              WHEN m.text IS NOT NULL AND m.text != '' THEN m.text
-              WHEN m.attributedBody IS NOT NULL THEN '[Rich text message]'
-              ELSE '[Attachment]'
-          END as content,
+          m.text as content,
           datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
           COALESCE(h.id, 'Me') as sender,
           m.is_from_me,
           m.cache_has_attachments,
-          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names
+          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names,
+          m.attributedBody
       FROM message m
       LEFT JOIN handle h ON h.ROWID = m.handle_id
       LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
@@ -240,7 +279,7 @@ private struct ReadMessagesTool {
     case .success(let messages):
       return encodeJSON(messages)
     case .failure(let error):
-      return "{\"error\": \"\(escapeJSON(error.message))\"}"
+      return mapDatabaseError(error)
     }
   }
 }
@@ -259,23 +298,20 @@ private struct GetUnreadMessagesTool {
     if let data = args.data(using: .utf8),
       let input = try? JSONDecoder().decode(Args.self, from: data)
     {
-      limit = min(input.limit ?? 10, 50)
+      limit = max(1, min(input.limit ?? 10, 50))
     } else {
       limit = 10
     }
 
     let query = """
       SELECT
-          CASE
-              WHEN m.text IS NOT NULL AND m.text != '' THEN m.text
-              WHEN m.attributedBody IS NOT NULL THEN '[Rich text message]'
-              ELSE '[Attachment]'
-          END as content,
+          m.text as content,
           datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
           COALESCE(h.id, 'Unknown') as sender,
           m.is_from_me,
           m.cache_has_attachments,
-          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names
+          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names,
+          m.attributedBody
       FROM message m
       LEFT JOIN handle h ON h.ROWID = m.handle_id
       LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
@@ -295,9 +331,26 @@ private struct GetUnreadMessagesTool {
     case .success(let messages):
       return encodeJSON(messages)
     case .failure(let error):
-      return "{\"error\": \"\(escapeJSON(error.message))\"}"
+      return mapDatabaseError(error)
     }
   }
+}
+
+// MARK: - Database Error Mapping
+
+/// Map a `DatabaseError` to a canonical failure envelope. Full Disk Access /
+/// open failures are environment issues the user must resolve, so they map to
+/// `unavailable`; everything else is an `execution_error`.
+private func mapDatabaseError(_ error: DatabaseError) -> String {
+  let msg = error.message
+  if msg.localizedCaseInsensitiveContains("Full Disk Access")
+    || msg.localizedCaseInsensitiveContains("Cannot access")
+    || msg.localizedCaseInsensitiveContains("unable to open")
+    || msg.localizedCaseInsensitiveContains("permission")
+  {
+    return Envelope.failure(.unavailable, msg, retryable: false)
+  }
+  return Envelope.failure(.executionError, msg)
 }
 
 // MARK: - Helper Functions
@@ -369,6 +422,87 @@ private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
   return UnsafePointer(ptr)
 }
 
+/// Plugin manifest JSON. Kept at file scope (rather than inline in
+/// `get_manifest`) so it can be parsed and validated by the test suite.
+/// Each tool MUST declare `id` + `description`: the host's `PluginManifest`
+/// decoder requires `id` and will fail to load the whole plugin otherwise.
+let messagesManifestJSON = """
+  {
+    "plugin_id": "osaurus.messages",
+    "name": "Messages",
+    "description": "A messages plugin for macOS Messages.app integration - send and read iMessages",
+    "license": "MIT",
+    "authors": ["Dinoki Labs"],
+    "min_macos": "13.0",
+    "min_osaurus": "0.5.0",
+    "capabilities": {
+      "tools": [
+        {
+          "id": "send_message",
+          "description": "Send a message to a phone number via iMessage (falls back to SMS when iMessage is unavailable)",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "phoneNumber": {
+                "type": "string",
+                "description": "The recipient's phone number (e.g., +1234567890 or 1234567890)"
+              },
+              "message": {
+                "type": "string",
+                "description": "The message content to send"
+              }
+            },
+            "required": ["phoneNumber", "message"],
+            "additionalProperties": false
+          },
+          "requirements": ["automation"],
+          "permission_policy": "ask"
+        },
+        {
+          "id": "read_messages",
+          "widget": true,
+          "description": "Read message history from a specific contact",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "phoneNumber": {
+                "type": "string",
+                "description": "The contact's phone number to read messages from"
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of messages to return (default: 10, max: 50)"
+              }
+            },
+            "required": ["phoneNumber"],
+            "additionalProperties": false
+          },
+          "requirements": ["disk"],
+          "permission_policy": "auto"
+        },
+        {
+          "id": "get_unread_messages",
+          "widget": true,
+          "description": "Get all unread messages from all contacts",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of messages to return (default: 10, max: 50)"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "requirements": ["disk"],
+          "permission_policy": "auto"
+        }
+      ]
+    }
+  }
+  """
+
 // API Implementation
 private var api: osr_plugin_api = {
   var api = osr_plugin_api()
@@ -388,81 +522,7 @@ private var api: osr_plugin_api = {
   }
 
   api.get_manifest = { ctxPtr in
-    // Manifest JSON matching new spec
-    let manifest = """
-      {
-        "plugin_id": "osaurus.messages",
-        "name": "Messages",
-        "description": "A messages plugin for macOS Messages.app integration - send and read iMessages",
-        "license": "MIT",
-        "authors": ["Dinoki Labs"],
-        "min_macos": "13.0",
-        "min_osaurus": "0.5.0",
-        "capabilities": {
-          "tools": [
-            {
-              "id": "send_message",
-              "description": "Send an iMessage to a phone number",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "phoneNumber": {
-                    "type": "string",
-                    "description": "The recipient's phone number (e.g., +1234567890 or 1234567890)"
-                  },
-                  "message": {
-                    "type": "string",
-                    "description": "The message content to send"
-                  }
-                },
-                "required": ["phoneNumber", "message"]
-              },
-              "requirements": ["automation"],
-              "permission_policy": "ask"
-            },
-            {
-              "id": "read_messages",
-              "widget": true,
-              "description": "Read message history from a specific contact",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "phoneNumber": {
-                    "type": "string",
-                    "description": "The contact's phone number to read messages from"
-                  },
-                  "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of messages to return (default: 10, max: 50)"
-                  }
-                },
-                "required": ["phoneNumber"]
-              },
-              "requirements": ["disk"],
-              "permission_policy": "auto"
-            },
-            {
-              "id": "get_unread_messages",
-              "widget": true,
-              "description": "Get all unread messages from all contacts",
-              "parameters": {
-                "type": "object",
-                "properties": {
-                  "limit": {
-                    "type": "integer",
-                    "description": "Maximum number of messages to return (default: 10, max: 50)"
-                  }
-                },
-                "required": []
-              },
-              "requirements": ["disk"],
-              "permission_policy": "auto"
-            }
-          ]
-        }
-      }
-      """
-    return makeCString(manifest)
+    return makeCString(messagesManifestJSON)
   }
 
   api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
