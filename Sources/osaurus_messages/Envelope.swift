@@ -19,6 +19,7 @@ enum Envelope {
         case executionError = "execution_error"
         case notFound = "not_found"
         case unavailable = "unavailable"
+        case timeout = "timeout"
     }
 
     /// Build a canonical failure envelope JSON string.
@@ -38,8 +39,9 @@ enum Envelope {
 
     private static func defaultRetryable(for kind: Kind) -> Bool {
         switch kind {
-        case .invalidArgs, .executionError, .unavailable: return true
-        case .notFound: return false
+        case .executionError, .unavailable, .timeout: return true
+        // invalid_args and not_found are deterministic — retrying cannot succeed
+        case .invalidArgs, .notFound: return false
         }
     }
 

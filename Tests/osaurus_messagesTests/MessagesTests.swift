@@ -15,6 +15,7 @@ final class MessagesTests: XCTestCase {
         let root = try XCTUnwrap(obj)
         XCTAssertEqual(root["plugin_id"] as? String, "osaurus.messages")
         XCTAssertEqual(root["name"] as? String, "Messages")
+        XCTAssertEqual(root["version"] as? String, "1.0.8")
 
         let caps = try XCTUnwrap(root["capabilities"] as? [String: Any])
         let tools = try XCTUnwrap(caps["tools"] as? [[String: Any]])
@@ -38,14 +39,17 @@ final class MessagesTests: XCTestCase {
         XCTAssertEqual(dict["ok"] as? Bool, false)
         XCTAssertEqual(dict["kind"] as? String, "invalid_args")
         XCTAssertEqual(dict["message"] as? String, "bad input")
-        XCTAssertEqual(dict["retryable"] as? Bool, true)
+        // invalid_args is deterministic — retrying the same arguments cannot succeed
+        XCTAssertEqual(dict["retryable"] as? Bool, false)
         // Host detection sniffs for a leading "ok":false marker.
         XCTAssertTrue(json.hasPrefix("{\"ok\":false"))
     }
 
     func testFailureEnvelopeRetryableDefaults() {
         XCTAssertTrue(Envelope.failure(.unavailable, "x").contains("\"retryable\":true"))
+        XCTAssertTrue(Envelope.failure(.timeout, "x").contains("\"retryable\":true"))
         XCTAssertTrue(Envelope.failure(.notFound, "x").contains("\"retryable\":false"))
+        XCTAssertTrue(Envelope.failure(.invalidArgs, "x").contains("\"retryable\":false"))
         XCTAssertTrue(Envelope.failure(.executionError, "x", retryable: false).contains("\"retryable\":false"))
     }
 
@@ -64,6 +68,17 @@ final class MessagesTests: XCTestCase {
         XCTAssertEqual(normalizePhoneNumber("15551234567"), ["+15551234567"])
         XCTAssertEqual(normalizePhoneNumber("+15551234567"), ["+15551234567"])
         XCTAssertEqual(normalizePhoneNumber("+44 20 7946 0958"), ["+442079460958"])
+    }
+
+    func testTenDigitUSDefaultOnlyWithoutCountryCodeIndicator() {
+        // Exactly 10 bare digits: the documented US default applies.
+        XCTAssertEqual(normalizePhoneNumber("5551234567"), ["+15551234567"])
+        // A '+' anywhere is a country-code indicator; never rewrite as US.
+        XCTAssertEqual(normalizePhoneNumber("+551234567 8"), ["+5512345678"])
+        XCTAssertEqual(normalizePhoneNumber("555123456+7"), ["+555123456+7"])
+        // 9 or 11 bare digits are not the US default shape.
+        XCTAssertEqual(normalizePhoneNumber("555123456"), ["+555123456"])
+        XCTAssertEqual(normalizePhoneNumber("25551234567"), ["+25551234567"])
     }
 
     // MARK: - attributedBody decoding
