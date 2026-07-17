@@ -1,4 +1,5 @@
 import Foundation
+import OsaurusPluginABI
 import OsaurusPluginKit
 import SQLite3
 
@@ -478,43 +479,13 @@ private func encodeJSON<T: Encodable>(_ value: T) -> String {
   return json
 }
 
-// MARK: - C ABI surface
-
-// Opaque context
-private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
-
-// Function pointers
-private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
-private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
-private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
-private typealias osr_get_manifest_t = @convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?
-private typealias osr_invoke_t =
-  @convention(c) (
-    osr_plugin_ctx_t?,
-    UnsafePointer<CChar>?,  // type
-    UnsafePointer<CChar>?,  // id
-    UnsafePointer<CChar>?  // payload
-  ) -> UnsafePointer<CChar>?
-
-private struct osr_plugin_api {
-  var free_string: osr_free_string_t?
-  var `init`: osr_init_t?
-  var destroy: osr_destroy_t?
-  var get_manifest: osr_get_manifest_t?
-  var invoke: osr_invoke_t?
-}
+// MARK: - C ABI surface (via osaurus-plugin-sdk)
 
 // Context state (simple wrapper class to hold state)
 private class PluginContext {
   let sendMessageTool = SendMessageTool()
   let readMessagesTool = ReadMessagesTool()
   let getUnreadMessagesTool = GetUnreadMessagesTool()
-}
-
-// Helper to return C strings
-private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-  guard let ptr = strdup(s) else { return nil }
-  return UnsafePointer(ptr)
 }
 
 /// Plugin manifest JSON. Kept at file scope (rather than inline in
@@ -600,28 +571,20 @@ let messagesManifestJSON = """
   """
 
 // API Implementation
-private var api: osr_plugin_api = {
-  var api = osr_plugin_api()
-
-  api.free_string = { ptr in
-    if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
-  }
-
-  api.`init` = {
+private var pluginAPI = PluginEntry.makeAPI(
+  version: OsrABIVersion.v2,
+  init: {
     let ctx = PluginContext()
     return Unmanaged.passRetained(ctx).toOpaque()
-  }
-
-  api.destroy = { ctxPtr in
+  },
+  destroy: { ctxPtr in
     guard let ctxPtr = ctxPtr else { return }
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
-  }
-
-  api.get_manifest = { ctxPtr in
-    return makeCString(messagesManifestJSON)
-  }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
+  },
+  getManifest: { ctxPtr in
+    return osrMakeCString(messagesManifestJSON)
+  },
+  invoke: { ctxPtr, typePtr, idPtr, payloadPtr in
     guard let ctxPtr = ctxPtr,
       let typePtr = typePtr,
       let idPtr = idPtr,
@@ -634,25 +597,34 @@ private var api: osr_plugin_api = {
     let payload = String(cString: payloadPtr)
 
     guard type == "tool" else {
-      return makeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
+      return osrMakeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
     }
 
     switch id {
     case ctx.sendMessageTool.name:
-      return makeCString(ctx.sendMessageTool.run(args: payload))
+      return osrMakeCString(ctx.sendMessageTool.run(args: payload))
     case ctx.readMessagesTool.name:
-      return makeCString(ctx.readMessagesTool.run(args: payload))
+      return osrMakeCString(ctx.readMessagesTool.run(args: payload))
     case ctx.getUnreadMessagesTool.name:
-      return makeCString(ctx.getUnreadMessagesTool.run(args: payload))
+      return osrMakeCString(ctx.getUnreadMessagesTool.run(args: payload))
     default:
-      return makeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
+      return osrMakeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
     }
   }
+)
 
-  return api
-}()
+// MARK: - Entry Points
 
+/// ABI v2 entry: the host injects its API table, captured into
+/// `HostBridge.shared`. Newer hosts try this symbol first.
+@_cdecl("osaurus_plugin_entry_v2")
+public func osaurus_plugin_entry_v2(_ host: UnsafeRawPointer?) -> UnsafeRawPointer? {
+  PluginEntry.enterV2(host, api: &pluginAPI)
+}
+
+/// Legacy ABI v1 entry — kept so old hosts (which never pass a host API)
+/// continue to load this plugin.
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
-  return UnsafeRawPointer(&api)
+  PluginEntry.enterV1(api: &pluginAPI)
 }
