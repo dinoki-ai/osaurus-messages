@@ -1,3 +1,4 @@
+import OsaurusPluginKit
 import SQLite3
 import XCTest
 
@@ -6,37 +7,37 @@ import XCTest
 final class SubprocessRunnerTests: XCTestCase {
 
     func testCapturesStdoutAndExitStatus() throws {
-        let result = try runSubprocess(
+        let result = try ProcessRunner.run(
             executable: "/bin/sh", arguments: ["-c", "printf hello"], timeout: 10)
-        XCTAssertEqual(result.terminationStatus, 0)
-        XCTAssertEqual(result.stdout, "hello")
+        XCTAssertEqual(result.exitStatus, 0)
+        XCTAssertEqual(result.stdoutText, "hello")
         XCTAssertFalse(result.timedOut)
     }
 
     func testLargeOutputDoesNotDeadlock() throws {
         // 4 MB of output — far beyond the ~64 KB kernel pipe buffer.
-        let result = try runSubprocess(
+        let result = try ProcessRunner.run(
             executable: "/bin/sh",
             arguments: ["-c", "dd if=/dev/zero bs=1024 count=4096 2>/dev/null | tr '\\0' 'x'"],
             timeout: 20)
-        XCTAssertEqual(result.terminationStatus, 0)
-        XCTAssertEqual(result.stdout.count, 4 * 1024 * 1024)
+        XCTAssertEqual(result.exitStatus, 0)
+        XCTAssertEqual(result.stdoutText.count, 4 * 1024 * 1024)
     }
 
     func testHungProcessIsKilledAndReportedAsTimedOut() throws {
         let start = Date()
-        let result = try runSubprocess(
+        let result = try ProcessRunner.run(
             executable: "/bin/sh", arguments: ["-c", "sleep 60"], timeout: 1)
         XCTAssertTrue(result.timedOut)
         XCTAssertLessThan(Date().timeIntervalSince(start), 30)
     }
 
     func testOutputIsCapped() throws {
-        let result = try runSubprocess(
+        let result = try ProcessRunner.run(
             executable: "/bin/sh",
             arguments: ["-c", "dd if=/dev/zero bs=1024 count=64 2>/dev/null | tr '\\0' 'x'"],
-            timeout: 20, outputCap: 1024)
-        XCTAssertEqual(result.stdout.count, 1024)
+            timeout: 20, maxOutputBytes: 1024)
+        XCTAssertEqual(result.stdoutText.count, 1024)
     }
 }
 

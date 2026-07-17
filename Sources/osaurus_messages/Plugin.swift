@@ -1,4 +1,5 @@
 import Foundation
+import OsaurusPluginKit
 import SQLite3
 
 // MARK: - AppleScript Helper
@@ -18,14 +19,14 @@ enum AppleScriptError: Error {
 /// How long an osascript invocation may run before it is killed.
 private let appleScriptTimeoutSeconds: TimeInterval = 30
 
-/// Run an AppleScript via the shared subprocess runner (`/usr/bin/osascript`).
+/// Run an AppleScript via the SDK's `ProcessRunner` (`/usr/bin/osascript`).
 /// Execution is bounded by `appleScriptTimeoutSeconds` — the previous
 /// synchronous `NSAppleScript` execution could hang the caller forever if
 /// Messages.app never responded.
 private func runAppleScript(_ script: String) -> Result<String, AppleScriptError> {
-  let result: SubprocessResult
+  let result: ProcessRunner.Output
   do {
-    result = try runSubprocess(
+    result = try ProcessRunner.run(
       executable: "/usr/bin/osascript", arguments: ["-e", script],
       timeout: appleScriptTimeoutSeconds)
   } catch {
@@ -36,12 +37,12 @@ private func runAppleScript(_ script: String) -> Result<String, AppleScriptError
     return .failure(.timedOut)
   }
 
-  if result.terminationStatus != 0 {
-    let stderr = result.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+  if result.exitStatus != 0 {
+    let stderr = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
     return .failure(.executionFailed(stderr.isEmpty ? "Unknown AppleScript error" : stderr))
   }
 
-  return .success(result.stdout.trimmingCharacters(in: .whitespacesAndNewlines))
+  return .success(result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
 // MARK: - Message Model
