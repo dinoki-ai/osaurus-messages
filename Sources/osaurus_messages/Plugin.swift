@@ -496,7 +496,7 @@ let messagesManifestJSON = """
   {
     "plugin_id": "osaurus.messages",
     "name": "Messages",
-    "version": "1.0.8",
+    "version": "1.1.0",
     "description": "A messages plugin for macOS Messages.app integration - send and read iMessages",
     "license": "MIT",
     "authors": ["Dinoki Labs"],

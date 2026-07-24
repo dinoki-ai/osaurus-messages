@@ -16,7 +16,7 @@ final class MessagesTests: XCTestCase {
         let root = try XCTUnwrap(obj)
         XCTAssertEqual(root["plugin_id"] as? String, "osaurus.messages")
         XCTAssertEqual(root["name"] as? String, "Messages")
-        XCTAssertEqual(root["version"] as? String, "1.0.8")
+        XCTAssertEqual(root["version"] as? String, "1.1.0")
 
         let caps = try XCTUnwrap(root["capabilities"] as? [String: Any])
         let tools = try XCTUnwrap(caps["tools"] as? [[String: Any]])
