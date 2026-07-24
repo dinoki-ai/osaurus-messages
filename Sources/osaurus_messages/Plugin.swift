@@ -1,32 +1,54 @@
-import Cocoa
 import Foundation
+import OsaurusPluginABI
+import OsaurusPluginKit
 import SQLite3
 
 // MARK: - AppleScript Helper
 
-private enum AppleScriptError: Error {
+enum AppleScriptError: Error {
   case executionFailed(String)
-  case noResult
+  case timedOut
+
+  var reason: String {
+    switch self {
+    case .executionFailed(let message): return message
+    case .timedOut: return "AppleScript timed out"
+    }
+  }
 }
 
-private func runAppleScript(_ script: String) -> Result<String, Error> {
-  var error: NSDictionary?
-  let appleScript = NSAppleScript(source: script)
+/// How long an osascript invocation may run before it is killed.
+private let appleScriptTimeoutSeconds: TimeInterval = 30
 
-  guard let result = appleScript?.executeAndReturnError(&error) else {
-    if let error = error {
-      let message = error[NSAppleScript.errorMessage] as? String ?? "Unknown AppleScript error"
-      return .failure(AppleScriptError.executionFailed(message))
-    }
-    return .failure(AppleScriptError.noResult)
+/// Run an AppleScript via the SDK's `ProcessRunner` (`/usr/bin/osascript`).
+/// Execution is bounded by `appleScriptTimeoutSeconds` — the previous
+/// synchronous `NSAppleScript` execution could hang the caller forever if
+/// Messages.app never responded.
+private func runAppleScript(_ script: String) -> Result<String, AppleScriptError> {
+  let result: ProcessRunner.Output
+  do {
+    result = try ProcessRunner.run(
+      executable: "/usr/bin/osascript", arguments: ["-e", script],
+      timeout: appleScriptTimeoutSeconds)
+  } catch {
+    return .failure(.executionFailed("Failed to launch osascript: \(error.localizedDescription)"))
   }
 
-  return .success(result.stringValue ?? "")
+  if result.timedOut {
+    return .failure(.timedOut)
+  }
+
+  if result.exitStatus != 0 {
+    let stderr = result.stderrText.trimmingCharacters(in: .whitespacesAndNewlines)
+    return .failure(.executionFailed(stderr.isEmpty ? "Unknown AppleScript error" : stderr))
+  }
+
+  return .success(result.stdoutText.trimmingCharacters(in: .whitespacesAndNewlines))
 }
 
 // MARK: - Message Model
 
-private struct Message: Codable {
+struct Message: Codable {
   let content: String
   let date: String
   let sender: String
@@ -36,6 +58,14 @@ private struct Message: Codable {
 
 // MARK: - Phone Number Normalization
 
+/// Normalize a phone number for Messages.app.
+///
+/// Numbers with an explicit country code (leading `+`, or the US `1` prefix on
+/// an 11-digit number) are used as-is. A bare number is assumed to be a US
+/// number and prefixed with `+1` ONLY when it is exactly 10 digits with no
+/// country-code indicator — this US default is deliberate (matching the
+/// plugin's historic behavior) and is not a general locale facility; users
+/// outside the US should pass full international numbers with `+`.
 func normalizePhoneNumber(_ phone: String) -> [String] {
   // Remove all non-numeric characters except +
   let cleaned = phone.filter { $0.isNumber || $0 == "+" }
@@ -45,13 +75,14 @@ func normalizePhoneNumber(_ phone: String) -> [String] {
     return [cleaned]
   }
 
-  // If it starts with 1 and has 11 digits total, assume US number
-  if cleaned.hasPrefix("1") && cleaned.count == 11 {
+  // If it starts with 1 and has 11 digits total, assume US number with its
+  // country code already present
+  if cleaned.hasPrefix("1") && cleaned.count == 11 && cleaned.allSatisfy({ $0.isNumber }) {
     return ["+\(cleaned)"]
   }
 
-  // If it's 10 digits, assume US number and add +1
-  if cleaned.count == 10 {
+  // Exactly 10 digits and no country-code indicator anywhere: assume US
+  if cleaned.count == 10 && cleaned.allSatisfy({ $0.isNumber }) {
     return ["+1\(cleaned)"]
   }
 
@@ -72,15 +103,16 @@ private func getMessagesDBPath() -> String {
 
 // MARK: - SQLite Query Helper
 
-private struct DatabaseError: Error {
+struct DatabaseError: Error {
   let message: String
 }
 
 private let SQLITE_TRANSIENT_PTR = unsafeBitCast(-1, to: sqlite3_destructor_type.self)
 
-private func queryMessages(query: String, params: [String] = []) -> Result<[Message], DatabaseError>
+func queryMessages(query: String, params: [String] = [], dbPath: String? = nil)
+  -> Result<[Message], DatabaseError>
 {
-  let dbPath = getMessagesDBPath()
+  let dbPath = dbPath ?? getMessagesDBPath()
   var db: OpaquePointer?
 
   let openResult = sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil)
@@ -112,7 +144,8 @@ private func queryMessages(query: String, params: [String] = []) -> Result<[Mess
   }
 
   var messages: [Message] = []
-  while sqlite3_step(stmt) == SQLITE_ROW {
+  var stepResult = sqlite3_step(stmt)
+  while stepResult == SQLITE_ROW {
     // Read each column, handling NULLs per-row so one bad row doesn't destroy all results
     let plainText = sqlite3_column_text(stmt, 0).map { String(cString: $0) }
     let date = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? "Unknown"
@@ -153,6 +186,20 @@ private func queryMessages(query: String, params: [String] = []) -> Result<[Mess
         isFromMe: isFromMe,
         attachments: attachments
       ))
+
+    stepResult = sqlite3_step(stmt)
+  }
+
+  // A row loop that ends on anything other than SQLITE_DONE means iteration
+  // failed partway (I/O error, corruption, busy database). Report it instead
+  // of returning a silently truncated result set.
+  guard stepResult == SQLITE_DONE else {
+    let err = String(cString: sqlite3_errmsg(db))
+    return .failure(
+      DatabaseError(
+        message:
+          "Query did not complete (SQLite code \(stepResult): \(err)). Read \(messages.count) row(s) before the error; results would be incomplete."
+      ))
   }
 
   return .success(messages)
@@ -187,33 +234,56 @@ private struct SendMessageTool {
 
     let escapedMessage = escapeAppleScript(input.message)
 
-    // Try iMessage first, then fall back to SMS (requires Text Message
-    // Forwarding). Previously this only ever used iMessage, so any recipient
-    // without iMessage — or any account where no iMessage service was active —
-    // failed outright.
-    let iMessageResult = runAppleScript(sendScript(service: "iMessage", phone: phoneNumber, message: escapedMessage))
-    if case .success = iMessageResult {
+    // Try iMessage first. Only fall back to SMS (requires Text Message
+    // Forwarding) when the failure indicates iMessage itself is unavailable
+    // for this account/recipient. Falling back on EVERY failure masked the
+    // original error (e.g. permission denials surfaced as SMS errors).
+    let iMessageResult = runAppleScript(
+      sendScript(service: "iMessage", phone: phoneNumber, message: escapedMessage))
+
+    let iMessageError: AppleScriptError
+    switch iMessageResult {
+    case .success:
       return "{\"success\": true, \"service\": \"iMessage\", \"message\": \"Message sent to \(escapeJSON(phoneNumber))\"}"
+    case .failure(let error):
+      iMessageError = error
     }
 
-    let smsResult = runAppleScript(sendScript(service: "SMS", phone: phoneNumber, message: escapedMessage))
+    if case .timedOut = iMessageError {
+      return Envelope.failure(
+        .timeout,
+        "Sending via iMessage timed out. Messages may be busy or waiting for user input — try again.")
+    }
+
+    let reason = iMessageError.reason
+    if isPermissionError(reason) {
+      return Envelope.failure(
+        .unavailable,
+        "Could not send message: \(reason). Ensure Messages.app is running and Osaurus has Automation permission for Messages.",
+        retryable: false)
+    }
+
+    guard isIMessageUnavailableError(reason) else {
+      // Preserve and report the original iMessage failure instead of masking
+      // it behind an unrelated SMS error.
+      return Envelope.failure(
+        .executionError, "Failed to send message to \(phoneNumber) via iMessage: \(reason)")
+    }
+
+    let smsResult = runAppleScript(
+      sendScript(service: "SMS", phone: phoneNumber, message: escapedMessage))
     switch smsResult {
     case .success:
-      return "{\"success\": true, \"service\": \"SMS\", \"message\": \"Message sent to \(escapeJSON(phoneNumber)) via SMS\"}"
-    case .failure(let error):
-      let reason = error.localizedDescription
-      // Permission/automation problems are environment issues the user must
-      // resolve, so surface them as `unavailable` (non-retryable as-is).
-      if reason.localizedCaseInsensitiveContains("not allowed")
-        || reason.localizedCaseInsensitiveContains("permission")
-        || reason.localizedCaseInsensitiveContains("Application isn’t running")
-      {
-        return Envelope.failure(
-          .unavailable,
-          "Could not send message: \(reason). Ensure Messages.app is running and Osaurus has Automation permission for Messages.",
-          retryable: false)
-      }
-      return Envelope.failure(.executionError, "Failed to send message to \(phoneNumber): \(reason)")
+      return "{\"success\": true, \"service\": \"SMS\", \"message\": \"Message sent to \(escapeJSON(phoneNumber)) via SMS (iMessage unavailable: \(escapeJSON(reason)))\"}"
+    case .failure(.timedOut):
+      return Envelope.failure(
+        .timeout,
+        "iMessage was unavailable (\(reason)) and the SMS fallback timed out. Try again.")
+    case .failure(let smsError):
+      return Envelope.failure(
+        .executionError,
+        "Failed to send message to \(phoneNumber). iMessage unavailable: \(reason). SMS fallback also failed: \(smsError.reason)"
+      )
     }
   }
 
@@ -226,6 +296,32 @@ private struct SendMessageTool {
       end tell
       """
   }
+}
+
+/// Whether an AppleScript send failure is a permission/automation problem the
+/// user must resolve (never worth an SMS fallback or retry with same setup).
+func isPermissionError(_ reason: String) -> Bool {
+  return reason.localizedCaseInsensitiveContains("not allowed")
+    || reason.localizedCaseInsensitiveContains("not authorized")
+    || reason.localizedCaseInsensitiveContains("permission")
+    || reason.localizedCaseInsensitiveContains("-1743")
+    || reason.localizedCaseInsensitiveContains("Application isn’t running")
+    || reason.localizedCaseInsensitiveContains("Application isn't running")
+}
+
+/// Whether a send failure indicates iMessage itself is unavailable for this
+/// account or recipient — the only category where an SMS fallback makes sense.
+/// Typical shapes: no iMessage service registered ("Can't get 1st service
+/// whose service type = iMessage") or the recipient has no iMessage buddy
+/// ("Can't get buddy ...").
+func isIMessageUnavailableError(_ reason: String) -> Bool {
+  let lower = reason.lowercased()
+  if isPermissionError(reason) { return false }
+  return lower.contains("can't get service") || lower.contains("can’t get service")
+    || lower.contains("can't get 1st service") || lower.contains("can’t get 1st service")
+    || lower.contains("can't get buddy") || lower.contains("can’t get buddy")
+    || lower.contains("not registered with imessage")
+    || (lower.contains("imessage") && lower.contains("unavailable"))
 }
 
 // MARK: - Read Messages Tool
@@ -383,43 +479,13 @@ private func encodeJSON<T: Encodable>(_ value: T) -> String {
   return json
 }
 
-// MARK: - C ABI surface
-
-// Opaque context
-private typealias osr_plugin_ctx_t = UnsafeMutableRawPointer
-
-// Function pointers
-private typealias osr_free_string_t = @convention(c) (UnsafePointer<CChar>?) -> Void
-private typealias osr_init_t = @convention(c) () -> osr_plugin_ctx_t?
-private typealias osr_destroy_t = @convention(c) (osr_plugin_ctx_t?) -> Void
-private typealias osr_get_manifest_t = @convention(c) (osr_plugin_ctx_t?) -> UnsafePointer<CChar>?
-private typealias osr_invoke_t =
-  @convention(c) (
-    osr_plugin_ctx_t?,
-    UnsafePointer<CChar>?,  // type
-    UnsafePointer<CChar>?,  // id
-    UnsafePointer<CChar>?  // payload
-  ) -> UnsafePointer<CChar>?
-
-private struct osr_plugin_api {
-  var free_string: osr_free_string_t?
-  var `init`: osr_init_t?
-  var destroy: osr_destroy_t?
-  var get_manifest: osr_get_manifest_t?
-  var invoke: osr_invoke_t?
-}
+// MARK: - C ABI surface (via osaurus-plugin-sdk)
 
 // Context state (simple wrapper class to hold state)
 private class PluginContext {
   let sendMessageTool = SendMessageTool()
   let readMessagesTool = ReadMessagesTool()
   let getUnreadMessagesTool = GetUnreadMessagesTool()
-}
-
-// Helper to return C strings
-private func makeCString(_ s: String) -> UnsafePointer<CChar>? {
-  guard let ptr = strdup(s) else { return nil }
-  return UnsafePointer(ptr)
 }
 
 /// Plugin manifest JSON. Kept at file scope (rather than inline in
@@ -430,6 +496,7 @@ let messagesManifestJSON = """
   {
     "plugin_id": "osaurus.messages",
     "name": "Messages",
+    "version": "1.0.8",
     "description": "A messages plugin for macOS Messages.app integration - send and read iMessages",
     "license": "MIT",
     "authors": ["Dinoki Labs"],
@@ -504,28 +571,20 @@ let messagesManifestJSON = """
   """
 
 // API Implementation
-private var api: osr_plugin_api = {
-  var api = osr_plugin_api()
-
-  api.free_string = { ptr in
-    if let p = ptr { free(UnsafeMutableRawPointer(mutating: p)) }
-  }
-
-  api.`init` = {
+private var pluginAPI = PluginEntry.makeAPI(
+  version: OsrABIVersion.v2,
+  init: {
     let ctx = PluginContext()
     return Unmanaged.passRetained(ctx).toOpaque()
-  }
-
-  api.destroy = { ctxPtr in
+  },
+  destroy: { ctxPtr in
     guard let ctxPtr = ctxPtr else { return }
     Unmanaged<PluginContext>.fromOpaque(ctxPtr).release()
-  }
-
-  api.get_manifest = { ctxPtr in
-    return makeCString(messagesManifestJSON)
-  }
-
-  api.invoke = { ctxPtr, typePtr, idPtr, payloadPtr in
+  },
+  getManifest: { ctxPtr in
+    return osrMakeCString(messagesManifestJSON)
+  },
+  invoke: { ctxPtr, typePtr, idPtr, payloadPtr in
     guard let ctxPtr = ctxPtr,
       let typePtr = typePtr,
       let idPtr = idPtr,
@@ -538,25 +597,34 @@ private var api: osr_plugin_api = {
     let payload = String(cString: payloadPtr)
 
     guard type == "tool" else {
-      return makeCString("{\"error\": \"Unknown capability type\"}")
+      return osrMakeCString(Envelope.failure(.invalidArgs, "Unknown capability type: \(type)"))
     }
 
     switch id {
     case ctx.sendMessageTool.name:
-      return makeCString(ctx.sendMessageTool.run(args: payload))
+      return osrMakeCString(ctx.sendMessageTool.run(args: payload))
     case ctx.readMessagesTool.name:
-      return makeCString(ctx.readMessagesTool.run(args: payload))
+      return osrMakeCString(ctx.readMessagesTool.run(args: payload))
     case ctx.getUnreadMessagesTool.name:
-      return makeCString(ctx.getUnreadMessagesTool.run(args: payload))
+      return osrMakeCString(ctx.getUnreadMessagesTool.run(args: payload))
     default:
-      return makeCString("{\"error\": \"Unknown tool: \(id)\"}")
+      return osrMakeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
     }
   }
+)
 
-  return api
-}()
+// MARK: - Entry Points
 
+/// ABI v2 entry: the host injects its API table, captured into
+/// `HostBridge.shared`. Newer hosts try this symbol first.
+@_cdecl("osaurus_plugin_entry_v2")
+public func osaurus_plugin_entry_v2(_ host: UnsafeRawPointer?) -> UnsafeRawPointer? {
+  PluginEntry.enterV2(host, api: &pluginAPI)
+}
+
+/// Legacy ABI v1 entry — kept so old hosts (which never pass a host API)
+/// continue to load this plugin.
 @_cdecl("osaurus_plugin_entry")
 public func osaurus_plugin_entry() -> UnsafeRawPointer? {
-  return UnsafeRawPointer(&api)
+  PluginEntry.enterV1(api: &pluginAPI)
 }
