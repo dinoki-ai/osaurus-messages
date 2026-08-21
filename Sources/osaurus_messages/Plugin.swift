@@ -432,6 +432,348 @@ private struct GetUnreadMessagesTool {
   }
 }
 
+// MARK: - Search Messages Tool
+
+private struct SearchMessagesTool {
+  let name = "search_messages"
+
+  struct Args: Decodable {
+    let query: String
+    let phoneNumber: String?
+    let limit: Int?
+  }
+
+  func run(args: String) -> String {
+    guard let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    else {
+      return Envelope.failure(.invalidArgs, "Could not parse arguments. Expected JSON with 'query' and optional 'phoneNumber'/'limit'.")
+    }
+
+    let needle = input.query.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !needle.isEmpty else {
+      return Envelope.failure(.invalidArgs, "'query' must not be empty.")
+    }
+
+    let limit = max(1, min(input.limit ?? 20, 50))
+
+    // Match against the plain `text` column with a case-insensitive substring.
+    // Rich-text-only messages (text NULL, body in attributedBody) are not
+    // full-text searchable here — SQLite can't see inside the blob — so we scope
+    // the search to messages that have a `text` value.
+    let escaped =
+      needle
+      .replacingOccurrences(of: "\\", with: "\\\\")
+      .replacingOccurrences(of: "%", with: "\\%")
+      .replacingOccurrences(of: "_", with: "\\_")
+    let pattern = "%\(escaped)%"
+
+    var params: [String] = [pattern]
+    var senderFilter = ""
+    if let phone = input.phoneNumber?.trimmingCharacters(in: .whitespacesAndNewlines), !phone.isEmpty {
+      guard let normalized = normalizePhoneNumber(phone).first, !normalized.isEmpty else {
+        return Envelope.failure(.invalidArgs, "Invalid phone number format: \(phone)")
+      }
+      senderFilter = "AND h.id = ?"
+      params.append(normalized)
+    }
+
+    let query = """
+      SELECT
+          m.text as content,
+          datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+          COALESCE(h.id, 'Me') as sender,
+          m.is_from_me,
+          m.cache_has_attachments,
+          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names,
+          m.attributedBody
+      FROM message m
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
+      LEFT JOIN attachment a ON a.ROWID = maj.attachment_id
+      WHERE m.text IS NOT NULL
+          AND m.text LIKE ? ESCAPE '\\'
+          AND m.item_type = 0
+          \(senderFilter)
+      GROUP BY m.ROWID
+      ORDER BY m.date DESC
+      LIMIT \(limit)
+      """
+
+    switch queryMessages(query: query, params: params) {
+    case .success(let messages):
+      return encodeJSON(messages)
+    case .failure(let error):
+      return mapDatabaseError(error)
+    }
+  }
+}
+
+// MARK: - List Conversations Tool
+
+struct Conversation: Codable {
+  let name: String
+  let identifier: String
+  let isGroup: Bool
+  let lastMessageDate: String
+  let unreadCount: Int
+}
+
+func queryConversations(query: String, params: [String] = [], dbPath: String? = nil)
+  -> Result<[Conversation], DatabaseError>
+{
+  let dbPath = dbPath ?? getMessagesDBPath()
+  var db: OpaquePointer?
+
+  let openResult = sqlite3_open_v2(dbPath, &db, SQLITE_OPEN_READONLY, nil)
+  guard openResult == SQLITE_OK, let db = db else {
+    let err = db.flatMap { String(cString: sqlite3_errmsg($0)) } ?? "Unknown error"
+    sqlite3_close(db)
+    if err.contains("unable to open") || err.contains("permission denied") {
+      return .failure(
+        DatabaseError(
+          message:
+            "Cannot access Messages database. Please grant Full Disk Access to the application in System Settings > Privacy & Security > Full Disk Access."
+        ))
+    }
+    return .failure(DatabaseError(message: "Database error: \(err)"))
+  }
+  defer { sqlite3_close(db) }
+
+  var stmt: OpaquePointer?
+  guard sqlite3_prepare_v2(db, query, -1, &stmt, nil) == SQLITE_OK else {
+    let err = String(cString: sqlite3_errmsg(db))
+    return .failure(DatabaseError(message: "Query error: \(err)"))
+  }
+  defer { sqlite3_finalize(stmt) }
+
+  for (i, param) in params.enumerated() {
+    sqlite3_bind_text(stmt, Int32(i + 1), param, -1, SQLITE_TRANSIENT_PTR)
+  }
+
+  var conversations: [Conversation] = []
+  var stepResult = sqlite3_step(stmt)
+  while stepResult == SQLITE_ROW {
+    let name = sqlite3_column_text(stmt, 0).map { String(cString: $0) } ?? "Unknown"
+    let identifier = sqlite3_column_text(stmt, 1).map { String(cString: $0) } ?? ""
+    let isGroup = sqlite3_column_int(stmt, 2) == 1
+    let lastDate = sqlite3_column_text(stmt, 3).map { String(cString: $0) } ?? "Unknown"
+    let unread = Int(sqlite3_column_int(stmt, 4))
+
+    conversations.append(
+      Conversation(
+        name: name.isEmpty ? identifier : name,
+        identifier: identifier,
+        isGroup: isGroup,
+        lastMessageDate: lastDate,
+        unreadCount: unread
+      ))
+    stepResult = sqlite3_step(stmt)
+  }
+
+  guard stepResult == SQLITE_DONE else {
+    let err = String(cString: sqlite3_errmsg(db))
+    return .failure(
+      DatabaseError(
+        message:
+          "Query did not complete (SQLite code \(stepResult): \(err)). Read \(conversations.count) row(s) before the error; results would be incomplete."
+      ))
+  }
+
+  return .success(conversations)
+}
+
+private struct ListConversationsTool {
+  let name = "list_conversations"
+
+  struct Args: Decodable {
+    let limit: Int?
+  }
+
+  func run(args: String) -> String {
+    let limit: Int
+    if let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    {
+      limit = max(1, min(input.limit ?? 15, 50))
+    } else {
+      limit = 15
+    }
+
+    // One row per chat (direct or group), most recently active first. `style`
+    // 43 marks a group chat, 45 a direct chat. Group display names are often
+    // empty, so fall back to the chat identifier.
+    let query = """
+      SELECT
+          COALESCE(NULLIF(c.display_name, ''), c.chat_identifier) AS name,
+          c.chat_identifier AS identifier,
+          CASE WHEN c.style = 43 THEN 1 ELSE 0 END AS is_group,
+          datetime(MAX(m.date)/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') AS last_date,
+          SUM(CASE WHEN m.is_from_me = 0 AND m.is_read = 0 THEN 1 ELSE 0 END) AS unread_count
+      FROM chat c
+      JOIN chat_message_join cmj ON cmj.chat_id = c.ROWID
+      JOIN message m ON m.ROWID = cmj.message_id
+      WHERE m.item_type = 0
+      GROUP BY c.ROWID
+      ORDER BY MAX(m.date) DESC
+      LIMIT \(limit)
+      """
+
+    switch queryConversations(query: query) {
+    case .success(let conversations):
+      return encodeJSON(conversations)
+    case .failure(let error):
+      return mapDatabaseError(error)
+    }
+  }
+}
+
+// MARK: - Detect Spam Tool
+
+struct SpamCandidate: Codable {
+  let sender: String
+  let date: String
+  let preview: String
+  let confidence: String
+  let reasons: [String]
+}
+
+/// Lightweight, transparent spam signals computed locally from a received
+/// message. This is a heuristic pre-filter, NOT a verdict — the reasons are
+/// returned so the model (and user) can make the final judgment. Deliberately
+/// conservative: signals are surfaced, nothing is auto-deleted.
+func spamSignals(sender: String, content: String) -> [String] {
+  var reasons: [String] = []
+  let lower = content.lowercased()
+
+  if content.range(of: "https?://", options: .regularExpression) != nil
+    || lower.contains("bit.ly") || lower.contains("tinyurl") || lower.contains("goo.gl")
+  {
+    reasons.append("contains a link")
+  }
+
+  let urgency = [
+    "urgent", "immediately", "act now", "final notice", "last chance", "expires",
+    "suspend", "locked", "verify your", "confirm your", "update your",
+  ]
+  if urgency.contains(where: lower.contains) {
+    reasons.append("uses urgency/pressure language")
+  }
+
+  let prize = [
+    "you won", "you've won", "winner", "congratulations", "free gift", "gift card",
+    "claim your", "prize", "reward", "refund",
+  ]
+  if prize.contains(where: lower.contains) {
+    reasons.append("mentions a prize/reward/refund")
+  }
+
+  let money = [
+    "bitcoin", "crypto", "investment", "wire transfer", "zelle", "venmo", "cash app",
+  ]
+  if money.contains(where: lower.contains) || content.contains("$") {
+    reasons.append("mentions money/payment")
+  }
+
+  let creds = [
+    "password", "ssn", "social security", "bank account", "login credentials",
+    "one-time", "verification code", "otp",
+  ]
+  if creds.contains(where: lower.contains) {
+    reasons.append("asks for credentials or codes")
+  }
+
+  // Sender shape: emails and short codes are common for bulk/spam senders,
+  // whereas a real contact is usually a full E.164 phone number.
+  if sender.contains("@") {
+    reasons.append("sender is an email address")
+  } else {
+    let digits = sender.filter { $0.isNumber }
+    if !digits.isEmpty && digits.count <= 6 && !sender.hasPrefix("+") {
+      reasons.append("sender is a short code")
+    }
+  }
+
+  return reasons
+}
+
+/// Map a signal count to a coarse confidence label.
+func spamConfidence(signalCount: Int) -> String {
+  switch signalCount {
+  case 0: return "none"
+  case 1: return "low"
+  case 2: return "medium"
+  default: return "high"
+  }
+}
+
+private struct DetectSpamTool {
+  let name = "detect_spam"
+
+  struct Args: Decodable {
+    let limit: Int?
+    let unreadOnly: Bool?
+  }
+
+  func run(args: String) -> String {
+    var limit = 30
+    var unreadOnly = false
+    if let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    {
+      limit = max(1, min(input.limit ?? 30, 50))
+      unreadOnly = input.unreadOnly ?? false
+    }
+
+    let unreadFilter = unreadOnly ? "AND m.is_read = 0" : ""
+    let query = """
+      SELECT
+          m.text as content,
+          datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+          COALESCE(h.id, 'Unknown') as sender,
+          m.is_from_me,
+          m.cache_has_attachments,
+          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names,
+          m.attributedBody
+      FROM message m
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
+      LEFT JOIN attachment a ON a.ROWID = maj.attachment_id
+      WHERE m.is_from_me = 0
+          \(unreadFilter)
+          AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
+          AND m.item_type = 0
+      GROUP BY m.ROWID
+      ORDER BY m.date DESC
+      LIMIT \(limit)
+      """
+
+    switch queryMessages(query: query) {
+    case .success(let messages):
+      let candidates =
+        messages
+        .map { msg -> SpamCandidate? in
+          let reasons = spamSignals(sender: msg.sender, content: msg.content)
+          guard !reasons.isEmpty else { return nil }
+          let preview =
+            msg.content.count > 140
+            ? String(msg.content.prefix(140)) + "…"
+            : msg.content
+          return SpamCandidate(
+            sender: msg.sender,
+            date: msg.date,
+            preview: preview,
+            confidence: spamConfidence(signalCount: reasons.count),
+            reasons: reasons)
+        }
+        .compactMap { $0 }
+      return encodeJSON(candidates)
+    case .failure(let error):
+      return mapDatabaseError(error)
+    }
+  }
+}
+
 // MARK: - Database Error Mapping
 
 /// Map a `DatabaseError` to a canonical failure envelope. Full Disk Access /
@@ -486,6 +828,9 @@ private class PluginContext {
   let sendMessageTool = SendMessageTool()
   let readMessagesTool = ReadMessagesTool()
   let getUnreadMessagesTool = GetUnreadMessagesTool()
+  let searchMessagesTool = SearchMessagesTool()
+  let listConversationsTool = ListConversationsTool()
+  let detectSpamTool = DetectSpamTool()
 }
 
 /// Plugin manifest JSON. Kept at file scope (rather than inline in
@@ -496,7 +841,7 @@ let messagesManifestJSON = """
   {
     "plugin_id": "osaurus.messages",
     "name": "Messages",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "description": "A messages plugin for macOS Messages.app integration - send and read iMessages",
     "license": "MIT",
     "authors": ["Dinoki Labs"],
@@ -564,6 +909,72 @@ let messagesManifestJSON = """
           },
           "requirements": ["disk"],
           "permission_policy": "auto"
+        },
+        {
+          "id": "search_messages",
+          "widget": true,
+          "description": "Search message history for text across all conversations, optionally scoped to one contact",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "query": {
+                "type": "string",
+                "description": "Text to search for (case-insensitive substring match)"
+              },
+              "phoneNumber": {
+                "type": "string",
+                "description": "Optional contact's phone number to limit the search to one conversation"
+              },
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of messages to return (default: 20, max: 50)"
+              }
+            },
+            "required": ["query"],
+            "additionalProperties": false
+          },
+          "requirements": ["disk"],
+          "permission_policy": "auto"
+        },
+        {
+          "id": "list_conversations",
+          "widget": true,
+          "description": "List recent conversations (direct and group chats) with unread counts, most recently active first",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of conversations to return (default: 15, max: 50)"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "requirements": ["disk"],
+          "permission_policy": "auto"
+        },
+        {
+          "id": "detect_spam",
+          "widget": true,
+          "description": "Scan recent received messages for likely spam and return flagged candidates with reasons and confidence (read-only, never deletes)",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of recent received messages to scan (default: 30, max: 50)"
+              },
+              "unreadOnly": {
+                "type": "boolean",
+                "description": "Only scan unread messages (default: false)"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "requirements": ["disk"],
+          "permission_policy": "auto"
         }
       ]
     }
@@ -607,6 +1018,12 @@ private var pluginAPI = PluginEntry.makeAPI(
       return osrMakeCString(ctx.readMessagesTool.run(args: payload))
     case ctx.getUnreadMessagesTool.name:
       return osrMakeCString(ctx.getUnreadMessagesTool.run(args: payload))
+    case ctx.searchMessagesTool.name:
+      return osrMakeCString(ctx.searchMessagesTool.run(args: payload))
+    case ctx.listConversationsTool.name:
+      return osrMakeCString(ctx.listConversationsTool.run(args: payload))
+    case ctx.detectSpamTool.name:
+      return osrMakeCString(ctx.detectSpamTool.run(args: payload))
     default:
       return osrMakeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
     }

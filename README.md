@@ -130,6 +130,96 @@ Get all unread messages from all contacts. Queries the Messages database directl
 ]
 ```
 
+### `search_messages`
+
+Search message history for text across all conversations. Reads the Messages database directly (read-only) using the native SQLite C API; nothing leaves the device.
+
+**Parameters:**
+
+- `query` (required): Text to search for (case-insensitive substring match)
+- `phoneNumber` (optional): Limit the search to a single contact's conversation
+- `limit` (optional): Maximum number of messages to return (default: 20, max: 50)
+
+**Example:**
+
+```json
+{
+  "query": "dinner",
+  "limit": 20
+}
+```
+
+**Response:** an array of message objects (same shape as `read_messages`), most recent first.
+
+> Note: search matches the plain-text body. Messages whose text lives only in the rich-text `attributedBody` blob are not full-text searchable.
+
+### `list_conversations`
+
+List recent conversations (direct and group chats) with unread counts, most recently active first. Useful for "catch me up" prompts. Read-only, local.
+
+**Parameters:**
+
+- `limit` (optional): Maximum number of conversations to return (default: 15, max: 50)
+
+**Example:**
+
+```json
+{
+  "limit": 15
+}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "name": "Weekend Trip",
+    "identifier": "chat123456789",
+    "isGroup": true,
+    "lastMessageDate": "2024-01-15 15:00:00",
+    "unreadCount": 3
+  }
+]
+```
+
+### `detect_spam`
+
+Scan recent received messages for likely spam and return flagged candidates with transparent reasons and a coarse confidence. Read-only and local. This is a heuristic pre-filter, not a verdict, and it **never deletes anything** — acting on a candidate stays a manual step.
+
+**Parameters:**
+
+- `limit` (optional): Maximum number of recent received messages to scan (default: 30, max: 50)
+- `unreadOnly` (optional): Only scan unread messages (default: false)
+
+**Example:**
+
+```json
+{
+  "limit": 30,
+  "unreadOnly": true
+}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "sender": "12345",
+    "date": "2024-01-15 15:00:00",
+    "preview": "URGENT: You won a $1000 gift card! Claim your prize now: http://bit.ly/x",
+    "confidence": "high",
+    "reasons": [
+      "contains a link",
+      "uses urgency/pressure language",
+      "mentions a prize/reward/refund",
+      "sender is a short code"
+    ]
+  }
+]
+```
+
 ## Message Object Format
 
 All message-reading tools return messages in this format:

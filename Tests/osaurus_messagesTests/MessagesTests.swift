@@ -16,11 +16,11 @@ final class MessagesTests: XCTestCase {
         let root = try XCTUnwrap(obj)
         XCTAssertEqual(root["plugin_id"] as? String, "osaurus.messages")
         XCTAssertEqual(root["name"] as? String, "Messages")
-        XCTAssertEqual(root["version"] as? String, "1.1.0")
+        XCTAssertEqual(root["version"] as? String, "1.2.0")
 
         let caps = try XCTUnwrap(root["capabilities"] as? [String: Any])
         let tools = try XCTUnwrap(caps["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 3)
+        XCTAssertEqual(tools.count, 6)
         for tool in tools {
             let id = try XCTUnwrap(tool["id"] as? String, "tool missing required 'id'")
             XCTAssertFalse(id.isEmpty)
@@ -28,7 +28,12 @@ final class MessagesTests: XCTestCase {
             XCTAssertFalse(desc.isEmpty)
         }
         let ids = Set(tools.compactMap { $0["id"] as? String })
-        XCTAssertEqual(ids, ["send_message", "read_messages", "get_unread_messages"])
+        XCTAssertEqual(
+            ids,
+            [
+                "send_message", "read_messages", "get_unread_messages", "search_messages",
+                "list_conversations", "detect_spam",
+            ])
     }
 
     // MARK: - Envelope
@@ -80,6 +85,27 @@ final class MessagesTests: XCTestCase {
         // 9 or 11 bare digits are not the US default shape.
         XCTAssertEqual(normalizePhoneNumber("555123456"), ["+555123456"])
         XCTAssertEqual(normalizePhoneNumber("25551234567"), ["+25551234567"])
+    }
+
+    // MARK: - Spam heuristics
+
+    func testSpamSignalsFlagsScamMessage() {
+        let reasons = spamSignals(
+            sender: "12345",
+            content: "URGENT: You won a $1000 gift card! Claim your prize now: http://bit.ly/x")
+        // link + urgency + prize + money + short code
+        XCTAssertTrue(reasons.contains("contains a link"))
+        XCTAssertTrue(reasons.contains("uses urgency/pressure language"))
+        XCTAssertTrue(reasons.contains("mentions a prize/reward/refund"))
+        XCTAssertTrue(reasons.contains("sender is a short code"))
+        XCTAssertEqual(spamConfidence(signalCount: reasons.count), "high")
+    }
+
+    func testSpamSignalsIgnoresNormalMessage() {
+        let reasons = spamSignals(
+            sender: "+15551234567", content: "Running 10 minutes late, see you soon")
+        XCTAssertTrue(reasons.isEmpty)
+        XCTAssertEqual(spamConfidence(signalCount: 0), "none")
     }
 
     // MARK: - attributedBody decoding
