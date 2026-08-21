@@ -183,6 +183,43 @@ List recent conversations (direct and group chats) with unread counts, most rece
 ]
 ```
 
+### `detect_spam`
+
+Scan recent received messages for likely spam and return flagged candidates with transparent reasons and a coarse confidence. Read-only and local. This is a heuristic pre-filter, not a verdict, and it **never deletes anything** — acting on a candidate stays a manual step.
+
+**Parameters:**
+
+- `limit` (optional): Maximum number of recent received messages to scan (default: 30, max: 50)
+- `unreadOnly` (optional): Only scan unread messages (default: false)
+
+**Example:**
+
+```json
+{
+  "limit": 30,
+  "unreadOnly": true
+}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "sender": "12345",
+    "date": "2024-01-15 15:00:00",
+    "preview": "URGENT: You won a $1000 gift card! Claim your prize now: http://bit.ly/x",
+    "confidence": "high",
+    "reasons": [
+      "contains a link",
+      "uses urgency/pressure language",
+      "mentions a prize/reward/refund",
+      "sender is a short code"
+    ]
+  }
+]
+```
+
 ## Message Object Format
 
 All message-reading tools return messages in this format:

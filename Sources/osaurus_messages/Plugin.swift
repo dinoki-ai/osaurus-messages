@@ -628,6 +628,152 @@ private struct ListConversationsTool {
   }
 }
 
+// MARK: - Detect Spam Tool
+
+struct SpamCandidate: Codable {
+  let sender: String
+  let date: String
+  let preview: String
+  let confidence: String
+  let reasons: [String]
+}
+
+/// Lightweight, transparent spam signals computed locally from a received
+/// message. This is a heuristic pre-filter, NOT a verdict — the reasons are
+/// returned so the model (and user) can make the final judgment. Deliberately
+/// conservative: signals are surfaced, nothing is auto-deleted.
+func spamSignals(sender: String, content: String) -> [String] {
+  var reasons: [String] = []
+  let lower = content.lowercased()
+
+  if content.range(of: "https?://", options: .regularExpression) != nil
+    || lower.contains("bit.ly") || lower.contains("tinyurl") || lower.contains("goo.gl")
+  {
+    reasons.append("contains a link")
+  }
+
+  let urgency = [
+    "urgent", "immediately", "act now", "final notice", "last chance", "expires",
+    "suspend", "locked", "verify your", "confirm your", "update your",
+  ]
+  if urgency.contains(where: lower.contains) {
+    reasons.append("uses urgency/pressure language")
+  }
+
+  let prize = [
+    "you won", "you've won", "winner", "congratulations", "free gift", "gift card",
+    "claim your", "prize", "reward", "refund",
+  ]
+  if prize.contains(where: lower.contains) {
+    reasons.append("mentions a prize/reward/refund")
+  }
+
+  let money = [
+    "bitcoin", "crypto", "investment", "wire transfer", "zelle", "venmo", "cash app",
+  ]
+  if money.contains(where: lower.contains) || content.contains("$") {
+    reasons.append("mentions money/payment")
+  }
+
+  let creds = [
+    "password", "ssn", "social security", "bank account", "login credentials",
+    "one-time", "verification code", "otp",
+  ]
+  if creds.contains(where: lower.contains) {
+    reasons.append("asks for credentials or codes")
+  }
+
+  // Sender shape: emails and short codes are common for bulk/spam senders,
+  // whereas a real contact is usually a full E.164 phone number.
+  if sender.contains("@") {
+    reasons.append("sender is an email address")
+  } else {
+    let digits = sender.filter { $0.isNumber }
+    if !digits.isEmpty && digits.count <= 6 && !sender.hasPrefix("+") {
+      reasons.append("sender is a short code")
+    }
+  }
+
+  return reasons
+}
+
+/// Map a signal count to a coarse confidence label.
+func spamConfidence(signalCount: Int) -> String {
+  switch signalCount {
+  case 0: return "none"
+  case 1: return "low"
+  case 2: return "medium"
+  default: return "high"
+  }
+}
+
+private struct DetectSpamTool {
+  let name = "detect_spam"
+
+  struct Args: Decodable {
+    let limit: Int?
+    let unreadOnly: Bool?
+  }
+
+  func run(args: String) -> String {
+    var limit = 30
+    var unreadOnly = false
+    if let data = args.data(using: .utf8),
+      let input = try? JSONDecoder().decode(Args.self, from: data)
+    {
+      limit = max(1, min(input.limit ?? 30, 50))
+      unreadOnly = input.unreadOnly ?? false
+    }
+
+    let unreadFilter = unreadOnly ? "AND m.is_read = 0" : ""
+    let query = """
+      SELECT
+          m.text as content,
+          datetime(m.date/1000000000 + strftime('%s', '2001-01-01'), 'unixepoch', 'localtime') as date,
+          COALESCE(h.id, 'Unknown') as sender,
+          m.is_from_me,
+          m.cache_has_attachments,
+          GROUP_CONCAT(DISTINCT a.transfer_name) as attachment_names,
+          m.attributedBody
+      FROM message m
+      LEFT JOIN handle h ON h.ROWID = m.handle_id
+      LEFT JOIN message_attachment_join maj ON maj.message_id = m.ROWID
+      LEFT JOIN attachment a ON a.ROWID = maj.attachment_id
+      WHERE m.is_from_me = 0
+          \(unreadFilter)
+          AND (m.text IS NOT NULL OR m.attributedBody IS NOT NULL)
+          AND m.item_type = 0
+      GROUP BY m.ROWID
+      ORDER BY m.date DESC
+      LIMIT \(limit)
+      """
+
+    switch queryMessages(query: query) {
+    case .success(let messages):
+      let candidates =
+        messages
+        .map { msg -> SpamCandidate? in
+          let reasons = spamSignals(sender: msg.sender, content: msg.content)
+          guard !reasons.isEmpty else { return nil }
+          let preview =
+            msg.content.count > 140
+            ? String(msg.content.prefix(140)) + "…"
+            : msg.content
+          return SpamCandidate(
+            sender: msg.sender,
+            date: msg.date,
+            preview: preview,
+            confidence: spamConfidence(signalCount: reasons.count),
+            reasons: reasons)
+        }
+        .compactMap { $0 }
+      return encodeJSON(candidates)
+    case .failure(let error):
+      return mapDatabaseError(error)
+    }
+  }
+}
+
 // MARK: - Database Error Mapping
 
 /// Map a `DatabaseError` to a canonical failure envelope. Full Disk Access /
@@ -684,6 +830,7 @@ private class PluginContext {
   let getUnreadMessagesTool = GetUnreadMessagesTool()
   let searchMessagesTool = SearchMessagesTool()
   let listConversationsTool = ListConversationsTool()
+  let detectSpamTool = DetectSpamTool()
 }
 
 /// Plugin manifest JSON. Kept at file scope (rather than inline in
@@ -806,6 +953,28 @@ let messagesManifestJSON = """
           },
           "requirements": ["disk"],
           "permission_policy": "auto"
+        },
+        {
+          "id": "detect_spam",
+          "widget": true,
+          "description": "Scan recent received messages for likely spam and return flagged candidates with reasons and confidence (read-only, never deletes)",
+          "parameters": {
+            "type": "object",
+            "properties": {
+              "limit": {
+                "type": "integer",
+                "description": "Maximum number of recent received messages to scan (default: 30, max: 50)"
+              },
+              "unreadOnly": {
+                "type": "boolean",
+                "description": "Only scan unread messages (default: false)"
+              }
+            },
+            "required": [],
+            "additionalProperties": false
+          },
+          "requirements": ["disk"],
+          "permission_policy": "auto"
         }
       ]
     }
@@ -853,6 +1022,8 @@ private var pluginAPI = PluginEntry.makeAPI(
       return osrMakeCString(ctx.searchMessagesTool.run(args: payload))
     case ctx.listConversationsTool.name:
       return osrMakeCString(ctx.listConversationsTool.run(args: payload))
+    case ctx.detectSpamTool.name:
+      return osrMakeCString(ctx.detectSpamTool.run(args: payload))
     default:
       return osrMakeCString(Envelope.failure(.notFound, "Unknown tool: \(id)"))
     }
