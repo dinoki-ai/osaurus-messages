@@ -16,11 +16,11 @@ final class MessagesTests: XCTestCase {
         let root = try XCTUnwrap(obj)
         XCTAssertEqual(root["plugin_id"] as? String, "osaurus.messages")
         XCTAssertEqual(root["name"] as? String, "Messages")
-        XCTAssertEqual(root["version"] as? String, "1.1.0")
+        XCTAssertEqual(root["version"] as? String, "1.2.0")
 
         let caps = try XCTUnwrap(root["capabilities"] as? [String: Any])
         let tools = try XCTUnwrap(caps["tools"] as? [[String: Any]])
-        XCTAssertEqual(tools.count, 3)
+        XCTAssertEqual(tools.count, 5)
         for tool in tools {
             let id = try XCTUnwrap(tool["id"] as? String, "tool missing required 'id'")
             XCTAssertFalse(id.isEmpty)
@@ -28,7 +28,9 @@ final class MessagesTests: XCTestCase {
             XCTAssertFalse(desc.isEmpty)
         }
         let ids = Set(tools.compactMap { $0["id"] as? String })
-        XCTAssertEqual(ids, ["send_message", "read_messages", "get_unread_messages"])
+        XCTAssertEqual(
+            ids,
+            ["send_message", "read_messages", "get_unread_messages", "search_messages", "list_conversations"])
     }
 
     // MARK: - Envelope

@@ -130,6 +130,59 @@ Get all unread messages from all contacts. Queries the Messages database directl
 ]
 ```
 
+### `search_messages`
+
+Search message history for text across all conversations. Reads the Messages database directly (read-only) using the native SQLite C API; nothing leaves the device.
+
+**Parameters:**
+
+- `query` (required): Text to search for (case-insensitive substring match)
+- `phoneNumber` (optional): Limit the search to a single contact's conversation
+- `limit` (optional): Maximum number of messages to return (default: 20, max: 50)
+
+**Example:**
+
+```json
+{
+  "query": "dinner",
+  "limit": 20
+}
+```
+
+**Response:** an array of message objects (same shape as `read_messages`), most recent first.
+
+> Note: search matches the plain-text body. Messages whose text lives only in the rich-text `attributedBody` blob are not full-text searchable.
+
+### `list_conversations`
+
+List recent conversations (direct and group chats) with unread counts, most recently active first. Useful for "catch me up" prompts. Read-only, local.
+
+**Parameters:**
+
+- `limit` (optional): Maximum number of conversations to return (default: 15, max: 50)
+
+**Example:**
+
+```json
+{
+  "limit": 15
+}
+```
+
+**Response:**
+
+```json
+[
+  {
+    "name": "Weekend Trip",
+    "identifier": "chat123456789",
+    "isGroup": true,
+    "lastMessageDate": "2024-01-15 15:00:00",
+    "unreadCount": 3
+  }
+]
+```
+
 ## Message Object Format
 
 All message-reading tools return messages in this format:
